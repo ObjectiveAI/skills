@@ -127,6 +127,45 @@ async fn reload_mid_session_returns_new_content() {
     );
 }
 
+/// `unload_skill` after a load reports success; a second unload (nothing loaded
+/// anymore) surfaces the tool-level error to the agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn unload_skill_unloads_and_errors_when_nothing_loaded() {
+    let host = Host::new("unload_skill_unloads_and_errors_when_nothing_loaded");
+    let n = nanos();
+    let lab = format!("unload-{n}");
+    let tag = format!("unload-tag-{n}");
+    create_lab_one(&host, &lab).await;
+
+    let agent = arcanum_agent_with_calls(vec![
+        tool_call("arcanum_load_skill", json!({ "laboratory_id": lab.clone(), "path": "/skills/greeting" })),
+        tool_call("arcanum_unload_skill", json!({})),
+        tool_call("arcanum_unload_skill", json!({})),
+    ]);
+    host.apply_tag(&tag, agent).await;
+    host.attach_lab(&tag, &lab).await;
+
+    let (aih, _) = host.spawn_tag(&tag).await;
+    host.wait(&aih).await;
+
+    let tool = host.tool_result_texts(&aih).await.join("\n");
+    // The load delivered the skill, the first unload succeeded, and the second
+    // unload hit the no-skill-loaded tool error.
+    assert!(tool.contains("Greeting skill"), "expected the loaded body; got: {tool}");
+    assert!(tool.contains("skill unloaded"), "expected the unload confirmation; got: {tool}");
+    assert!(
+        tool.contains("no skill is loaded"),
+        "expected the no-skill tool error on the second unload; got: {tool}"
+    );
+
+    // And still nothing enqueued.
+    let msgs = host.pending_texts(&aih).await.join("\n---\n");
+    assert!(
+        !msgs.contains("<arcanum>"),
+        "unload must not enqueue anything; got: {msgs}"
+    );
+}
+
 /// Loading a skill at a path with no SKILL.md errors and injects nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn load_skill_missing_path_does_not_inject() {
