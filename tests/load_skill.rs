@@ -70,11 +70,16 @@ async fn load_skill_returns_content() {
     let (aih, _) = host.spawn_tag(&tag).await;
     host.wait(&aih).await;
 
-    // load_skill returns the SKILL.md content (via `agents logs`).
+    // load_skill returns the SKILL.md BODY (via `agents logs`) with the
+    // frontmatter stripped.
     let tool = host.tool_result_texts(&aih).await.join("\n");
     assert!(
         tool.contains("Greeting skill"),
-        "load_skill should return the SKILL.md content; got: {tool}"
+        "load_skill should return the SKILL.md body; got: {tool}"
+    );
+    assert!(
+        !tool.contains("---") && !tool.contains("when_to_use") && !tool.contains("hello-skill"),
+        "the frontmatter must be stripped from the loaded skill; got: {tool}"
     );
 
     // Loading enqueues nothing — injection is the monitor's job.
@@ -105,10 +110,14 @@ async fn reload_mid_session_returns_new_content() {
     let (aih, _) = host.spawn_tag(&tag).await;
     host.wait(&aih).await;
 
-    // Both loads returned their content to the agent.
+    // Both loads returned their bodies (frontmatter stripped) to the agent.
     let tool = host.tool_result_texts(&aih).await.join("\n");
-    assert!(tool.contains("Greeting skill"), "expected greeting content; got: {tool}");
-    assert!(tool.contains("Farewell skill"), "expected farewell content; got: {tool}");
+    assert!(tool.contains("Greeting skill"), "expected greeting body; got: {tool}");
+    assert!(tool.contains("Farewell skill"), "expected farewell body; got: {tool}");
+    assert!(
+        !tool.contains("---") && !tool.contains("description:"),
+        "the frontmatter must be stripped from loaded skills; got: {tool}"
+    );
 
     // Still nothing enqueued (no growth → monitor never refreshes).
     let msgs = host.pending_texts(&aih).await.join("\n---\n");

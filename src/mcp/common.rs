@@ -52,7 +52,7 @@ fn parse_token_repeat(raw: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_token_repeat;
+    use super::{parse_frontmatter, parse_token_repeat};
 
     #[test]
     fn token_repeat_accepts_string_and_number() {
@@ -65,6 +65,66 @@ mod tests {
         assert_eq!(parse_token_repeat(r#"{}"#), None);
         assert_eq!(parse_token_repeat(r#"{"token-repeat":"abc"}"#), None);
         assert_eq!(parse_token_repeat(r#"not json"#), None);
+    }
+
+    #[test]
+    fn frontmatter_absent_keeps_whole_body() {
+        let (fm, body) = parse_frontmatter("just body\nmore");
+        assert!(fm.name.is_none() && fm.description.is_none() && fm.when_to_use.is_none());
+        assert_eq!(body, "just body\nmore");
+    }
+
+    #[test]
+    fn frontmatter_full_fields_and_body() {
+        let (fm, body) =
+            parse_frontmatter("---\nname: n\ndescription: d\nwhen_to_use: w\n---\nthe body\nline2");
+        assert_eq!(fm.name.as_deref(), Some("n"));
+        assert_eq!(fm.description.as_deref(), Some("d"));
+        assert_eq!(fm.when_to_use.as_deref(), Some("w"));
+        assert_eq!(body, "the body\nline2");
+    }
+
+    #[test]
+    fn frontmatter_partial_and_extra_keys_ignored() {
+        let (fm, _) = parse_frontmatter("---\nname: only\nmodel: x\n---\nb");
+        assert_eq!(fm.name.as_deref(), Some("only"));
+        assert!(fm.description.is_none());
+        assert!(fm.when_to_use.is_none());
+    }
+
+    #[test]
+    fn frontmatter_strips_matching_quotes() {
+        let (fm, _) = parse_frontmatter("---\nname: \"quoted\"\ndescription: 'single'\n---\nb");
+        assert_eq!(fm.name.as_deref(), Some("quoted"));
+        assert_eq!(fm.description.as_deref(), Some("single"));
+    }
+
+    #[test]
+    fn frontmatter_value_may_contain_colons() {
+        let (fm, _) = parse_frontmatter("---\nwhen_to_use: use when: it applies\n---\nb");
+        assert_eq!(fm.when_to_use.as_deref(), Some("use when: it applies"));
+    }
+
+    #[test]
+    fn frontmatter_empty_value_is_absent() {
+        let (fm, _) = parse_frontmatter("---\nname:\ndescription: d\n---\nb");
+        assert!(fm.name.is_none());
+        assert_eq!(fm.description.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn frontmatter_no_closing_fence_is_absent() {
+        let content = "---\nname: n\nno closing fence";
+        let (fm, body) = parse_frontmatter(content);
+        assert!(fm.name.is_none());
+        assert_eq!(body, content);
+    }
+
+    #[test]
+    fn frontmatter_crlf_tolerated() {
+        let (fm, body) = parse_frontmatter("---\r\nname: n\r\n---\r\nbody\r\nx");
+        assert_eq!(fm.name.as_deref(), Some("n"));
+        assert_eq!(body, "body\nx");
     }
 }
 
@@ -146,9 +206,81 @@ pub async fn lab_bash(
     Some(parsed.stdout)
 }
 
+/// The recognized `SKILL.md` YAML frontmatter fields. All optional; unknown keys
+/// are ignored.
+#[derive(Default)]
+pub struct Frontmatter {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub when_to_use: Option<String>,
+}
+
+/// Split a `SKILL.md` into its (frontmatter fields, body). A file has
+/// frontmatter only if its first line is exactly `---` and a later line is
+/// exactly `---`; the body is everything after that closing fence. Otherwise
+/// (no fence, or no closing fence) there is no frontmatter and the whole content
+/// is the body — the unchanged behavior for plain files.
+///
+/// Only simple single-line scalar values are supported (`key: value`, optional
+/// surrounding quotes). Empty values are treated as absent.
+pub fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
+    let mut lines = content.lines();
+    match lines.next() {
+        Some(first) if first.trim() == "---" => {}
+        _ => return (Frontmatter::default(), content.to_string()),
+    }
+
+    let mut fm_lines = Vec::new();
+    let mut body_lines = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if !closed && line.trim() == "---" {
+            closed = true;
+        } else if closed {
+            body_lines.push(line);
+        } else {
+            fm_lines.push(line);
+        }
+    }
+    // No closing fence → not valid frontmatter; keep the whole file as body.
+    if !closed {
+        return (Frontmatter::default(), content.to_string());
+    }
+
+    let mut fm = Frontmatter::default();
+    for line in fm_lines {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = strip_quotes(value.trim());
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "name" => fm.name = Some(value.to_string()),
+            "description" => fm.description = Some(value.to_string()),
+            "when_to_use" => fm.when_to_use = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    (fm, body_lines.join("\n"))
+}
+
+/// Strip one matching pair of surrounding single or double quotes, if present.
+fn strip_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    match (bytes.first(), bytes.last()) {
+        (Some(&a), Some(&b)) if s.len() >= 2 && a == b && (a == b'"' || a == b'\'') => {
+            &s[1..s.len() - 1]
+        }
+        _ => s,
+    }
+}
+
 /// Read the `SKILL.md` (case-insensitive) directly under `path` in laboratory
-/// `lab_id`, via the agent's live `response_id`. Returns the trimmed content, or
-/// `None` if the lab isn't connected / the file is missing / the read fails.
+/// `lab_id`, via the agent's live `response_id`, and return its **body**
+/// (frontmatter stripped), trimmed. `None` if the lab isn't connected / the file
+/// is missing / the read fails / the body is empty.
 pub async fn read_skill_md(
     executor: &PluginExecutor,
     response_id: &str,
@@ -163,8 +295,9 @@ pub async fn read_skill_md(
         path = shell_single_quote(path),
     );
     let content = lab_bash(executor, response_id, &tool, &command).await?;
-    let content = content.trim_end_matches('\n');
-    (!content.is_empty()).then(|| content.to_string())
+    let (_, body) = parse_frontmatter(&content);
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 /// Single-quote a string for safe embedding in a bash command.
