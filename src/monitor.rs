@@ -14,6 +14,7 @@
 //! re-read on each injection so edits are picked up.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -67,11 +68,22 @@ fn decide(base: Option<i64>, new: i64, token_repeat: i64, has_skill: bool) -> Ti
     }
 }
 
-/// Runs the per-AIH token-usage monitor loops in the daemon. One loop per AIH.
+/// Runs the per-AIH token-usage monitor loops in the daemon. At most one loop
+/// per AIH: spawning a monitor for an AIH kills whichever monitor was already
+/// running for it. Two triggers reach the same [`spawn`]: MCP begin (via
+/// [`on_begin`], which only spawns if a skill is loaded) and skill load (via
+/// `load_skill`, which records the baseline then calls [`spawn`] directly). The
+/// spawner itself is identical for both.
+///
+/// [`on_begin`]: MonitorService::on_begin
+/// [`spawn`]: MonitorService::spawn
 pub struct MonitorService {
     db: Db,
     executor: PluginExecutor,
-    running: DashMap<String, JoinHandle<()>>,
+    /// Live monitors keyed by AIH, each tagged with the generation that spawned
+    /// it so a loop only deregisters itself if a newer spawn hasn't replaced it.
+    running: DashMap<String, (u64, JoinHandle<()>)>,
+    next_generation: AtomicU64,
 }
 
 impl MonitorService {
@@ -80,36 +92,52 @@ impl MonitorService {
             db,
             executor,
             running: DashMap::new(),
+            next_generation: AtomicU64::new(0),
         })
     }
 
-    /// Start monitoring `aih` (with the given `token_repeat`), but only if a
-    /// baseline already exists (the begin / reconnect path). No-op if already
-    /// running or no baseline yet.
-    pub async fn ensure(self: &Arc<Self>, aih: &str, token_repeat: i64) {
-        if self.running.contains_key(aih) {
-            return;
+    /// The MCP-begin trigger: start a monitor for `aih`, but ONLY if a skill is
+    /// already loaded. A loaded skill always has a recorded token baseline (set
+    /// atomically at load time), so a loaded skill with no baseline is an
+    /// impossible state and panics.
+    pub async fn on_begin(self: &Arc<Self>, aih: &str, token_repeat: i64) {
+        match self.db.skill_ref(aih).await {
+            Ok(Some(_)) => {}
+            // No skill loaded → nothing to monitor at begin.
+            Ok(None) => return,
+            // Transient DB error → a later begin NOTIFY retries.
+            Err(_) => return,
         }
-        if matches!(self.db.last_total_tokens(aih).await, Ok(Some(_))) {
-            self.spawn(aih.to_string(), token_repeat);
+        match self.db.last_total_tokens(aih).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!(
+                "arcanum monitor invariant violated: skill loaded for {aih} but no token baseline"
+            ),
+            Err(_) => return,
         }
-    }
-
-    /// Start monitoring `aih` unconditionally (the `load_skill` first-load path).
-    pub fn start(self: &Arc<Self>, aih: &str, token_repeat: i64) {
         self.spawn(aih.to_string(), token_repeat);
     }
 
-    /// Spawn the loop for `aih` iff one isn't already running (atomic via the
-    /// DashMap entry lock). The task removes itself from the registry on exit.
-    fn spawn(self: &Arc<Self>, aih: String, token_repeat: i64) {
-        if let Entry::Vacant(slot) = self.running.entry(aih.clone()) {
-            let this = self.clone();
-            let handle = tokio::spawn(async move {
-                this.run_loop(&aih, token_repeat).await;
-                this.running.remove(&aih);
-            });
-            slot.insert(handle);
+    /// Spawn a fresh monitor loop for `aih`, killing any monitor already running
+    /// for it. This is the identical spawner both triggers use — it touches no
+    /// baseline: recording the token count is the caller's job (the skill-load
+    /// path does it before calling here; the begin path relies on the baseline
+    /// recorded at load). The loop deregisters itself on exit, but only if a
+    /// newer spawn hasn't already replaced (and aborted) it.
+    pub fn spawn(self: &Arc<Self>, aih: String, token_repeat: i64) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let this = self.clone();
+        let loop_aih = aih.clone();
+        let handle = tokio::spawn(async move {
+            this.run_loop(&loop_aih, token_repeat).await;
+            if let Entry::Occupied(slot) = this.running.entry(loop_aih) {
+                if slot.get().0 == generation {
+                    slot.remove();
+                }
+            }
+        });
+        if let Some((_, previous)) = self.running.insert(aih, (generation, handle)) {
+            previous.abort();
         }
     }
 

@@ -61,23 +61,20 @@ impl ArcanumMcp {
             .await
             .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
 
-        // Register the loaded skill reference (its id + path — not the content,
-        // which the monitor re-reads fresh on each refresh). Every load resets
-        // the monitor below, so an agent can deliberately re-load to refresh.
-        db.set_skill(&aih, &req.laboratory_id, &req.path, &response_id)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
-
         // Loading does NOT enqueue: the freshly loaded skill reaches the agent
-        // in this tool response (returned below). Reset the monitor baseline to
-        // the agent's current token count — "now" is the last time it saw the
-        // skill — then start the monitor. The monitor is a REFRESHER: it
-        // re-injects the skill only once usage grows past `token_repeat`.
+        // in this tool response (returned below). Read the agent's current token
+        // count and record it as the monitor baseline — "now" is the last time
+        // the agent saw the skill — ATOMICALLY with the skill reference (its id
+        // + path; not the content, which the monitor re-reads fresh on each
+        // refresh), so a loaded skill always has a baseline. Then spawn the
+        // monitor, a REFRESHER that re-injects only once usage grows past
+        // `token_repeat`. Every load resets this, so an agent can deliberately
+        // re-load to refresh.
         let baseline = self.monitor.token_usage_get(&aih).await.unwrap_or(0);
-        db.set_last_total_tokens(&aih, baseline)
+        db.set_skill(&aih, &req.laboratory_id, &req.path, &response_id, baseline)
             .await
             .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
-        self.monitor.start(&aih, token_repeat);
+        self.monitor.spawn(aih, token_repeat);
 
         Ok(CallToolResult::success(vec![Content::text(content)]))
     }

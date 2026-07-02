@@ -55,27 +55,32 @@ impl Db {
         Ok(())
     }
 
-    /// Set the loaded skill reference + response id, creating the row if new.
+    /// Set the loaded skill reference + response id AND the monitor baseline in
+    /// one upsert, creating the row if new. Writing them together upholds the
+    /// invariant the monitor relies on: a loaded skill always has a baseline.
     pub async fn set_skill(
         &self,
         aih: &str,
         laboratory_id: &str,
         skill_path: &str,
         response_id: &str,
+        last_total_tokens: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO arcanum_agents \
-                 (agent_instance_hierarchy, laboratory_id, skill_path, response_id) \
-             VALUES ($1, $2, $3, $4) \
+                 (agent_instance_hierarchy, laboratory_id, skill_path, response_id, last_total_tokens) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (agent_instance_hierarchy) DO UPDATE SET \
                  laboratory_id = excluded.laboratory_id, \
                  skill_path = excluded.skill_path, \
-                 response_id = excluded.response_id",
+                 response_id = excluded.response_id, \
+                 last_total_tokens = excluded.last_total_tokens",
         )
         .bind(aih)
         .bind(laboratory_id)
         .bind(skill_path)
         .bind(response_id)
+        .bind(last_total_tokens)
         .execute(&self.pool)
         .await?;
         Ok(())

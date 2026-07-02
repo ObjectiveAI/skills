@@ -82,8 +82,8 @@ struct MonitorNotification {
 }
 
 /// Background task: LISTEN on the `arcanum_monitor` channel and, for each
-/// notified AIH, ensure its monitor loop is running (started only if a baseline
-/// already exists — see [`MonitorService::ensure`]). Reconnects on error.
+/// notified AIH, run the begin trigger — (re)start its monitor loop, but only if
+/// a skill is loaded (see [`MonitorService::on_begin`]). Reconnects on error.
 fn spawn_monitor_listener(db: crate::db::Db, monitor: Arc<MonitorService>) {
     tokio::spawn(async move {
         loop {
@@ -97,7 +97,7 @@ fn spawn_monitor_listener(db: crate::db::Db, monitor: Arc<MonitorService>) {
             // Drain notifications until the connection drops, then reconnect.
             while let Ok(notification) = listener.recv().await {
                 if let Ok(n) = serde_json::from_str::<MonitorNotification>(notification.payload()) {
-                    monitor.ensure(&n.aih, n.token_repeat).await;
+                    monitor.on_begin(&n.aih, n.token_repeat).await;
                 }
             }
         }
