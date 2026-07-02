@@ -99,7 +99,11 @@ echo "      cli/$(basename "$CLI_ZIP")"
 # the versioned release zip under .objectiveai/bin and reuses it on re-runs,
 # then unpacks the host binaries into .objectiveai/bin.
 if [ "$NO_TEST" = "0" ]; then
-  OAI_VERSION="$(sed -n -E 's/^objectiveai-sdk = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+  # Handle both `objectiveai-sdk = "X"` and the table form
+  # `objectiveai-sdk = { version = "X", features = [...] }` — grab the first
+  # quoted token on the first objectiveai-sdk line (version precedes features).
+  OAI_VERSION="$(grep -m1 -E '^objectiveai-sdk[[:space:]]*=' Cargo.toml \
+    | sed -n -E 's/[^"]*"([^"]+)".*/\1/p')"
   [ -n "$OAI_VERSION" ] \
     || { echo "build.sh: could not read objectiveai-sdk version from Cargo.toml" >&2; exit 1; }
   echo "==> installing objectiveai host v$OAI_VERSION into .objectiveai/bin"

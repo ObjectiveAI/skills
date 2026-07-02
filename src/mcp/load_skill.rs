@@ -1,6 +1,8 @@
-//! The `load_skill` toolset: read a laboratory's `SKILL.md`, register it as the
-//! agent's loaded skill, inject it immediately, and start token-usage monitoring
-//! so it gets re-injected as the agent's context grows.
+//! The `load_skill` toolset: read a laboratory's `SKILL.md`, return it to the
+//! agent as the tool response, register it as the agent's loaded skill, reset
+//! the monitor baseline to the current token count, and start token-usage
+//! monitoring so the skill is RE-injected (refreshed) as the agent's context
+//! grows. Loading itself does not enqueue — the monitor is the only injector.
 
 use rmcp::{
     ErrorData, RoleServer, tool, tool_router,
@@ -53,25 +55,28 @@ impl ArcanumMcp {
             )
         })?;
 
-        // Register the loaded skill's reference + this response id (the monitor
-        // re-reads the content fresh on each injection). On the FIRST load (no
-        // baseline yet) inject immediately and establish the baseline, then start
-        // the monitor loop.
         let db = self
             .context
             .db()
             .await
             .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
-        let had_baseline = db.last_total_tokens(&aih).await.ok().flatten().is_some();
+
+        // Register the loaded skill reference (its id + path — not the content,
+        // which the monitor re-reads fresh on each refresh). Every load resets
+        // the monitor below, so an agent can deliberately re-load to refresh.
         db.set_skill(&aih, &req.laboratory_id, &req.path, &response_id)
             .await
             .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
 
-        if !had_baseline {
-            self.monitor.enqueue(&aih, &content).await;
-            let baseline = self.monitor.token_usage_get(&aih).await.unwrap_or(0);
-            let _ = db.set_last_total_tokens(&aih, baseline).await;
-        }
+        // Loading does NOT enqueue: the freshly loaded skill reaches the agent
+        // in this tool response (returned below). Reset the monitor baseline to
+        // the agent's current token count — "now" is the last time it saw the
+        // skill — then start the monitor. The monitor is a REFRESHER: it
+        // re-injects the skill only once usage grows past `token_repeat`.
+        let baseline = self.monitor.token_usage_get(&aih).await.unwrap_or(0);
+        db.set_last_total_tokens(&aih, baseline)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
         self.monitor.start(&aih, token_repeat);
 
         Ok(CallToolResult::success(vec![Content::text(content)]))

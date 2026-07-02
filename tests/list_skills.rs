@@ -89,10 +89,10 @@ async fn skills_listed_across_laboratories() {
     host.attach_lab(&tag, &lab_one).await;
     host.attach_lab(&tag, &lab_two).await;
 
-    let (aih, response_id) = host.spawn_tag(&tag).await;
+    let (aih, _response_id) = host.spawn_tag(&tag).await;
     host.wait(&aih).await;
 
-    let items = skills_from(&host.tool_texts(&response_id).await);
+    let items = skills_from(&host.tool_result_texts(&aih).await);
 
     // lab-one: greeting, farewell.
     assert!(has(&items, &lab_one, "greeting", "/skills/greeting"), "missing lab-one greeting: {items:?}");
@@ -153,16 +153,16 @@ async fn skills_scoped_per_agent_across_permutations() {
     host.attach_lab(&tag_ab, &lab_a).await;
     host.attach_lab(&tag_ab, &lab_b).await;
 
-    // Spawn all three concurrently (spawn_tag also waits for completion).
-    let ((_, rid_a), (_, rid_b), (_, rid_ab)) = tokio::join!(
+    // Spawn all three concurrently (spawn_tag streams to completion).
+    let ((aih_a, _), (aih_b, _), (aih_ab, _)) = tokio::join!(
         host.spawn_tag(&tag_a),
         host.spawn_tag(&tag_b),
         host.spawn_tag(&tag_ab),
     );
 
-    let items_a = skills_from(&host.tool_texts(&rid_a).await);
-    let items_b = skills_from(&host.tool_texts(&rid_b).await);
-    let items_ab = skills_from(&host.tool_texts(&rid_ab).await);
+    let items_a = skills_from(&host.tool_result_texts(&aih_a).await);
+    let items_b = skills_from(&host.tool_result_texts(&aih_b).await);
+    let items_ab = skills_from(&host.tool_result_texts(&aih_ab).await);
 
     // Agent A: only lab-a's two skills.
     assert_eq!(items_a.len(), 2, "agent A count: {items_a:?}");

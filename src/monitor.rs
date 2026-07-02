@@ -32,6 +32,41 @@ use crate::mcp::common;
 /// any still-queued earlier one for the same agent.
 const ENQUEUE_KEY: &str = "arcanum-skill";
 
+/// Wrap a skill's content as the `<arcanum>…</arcanum>` message the agent sees.
+fn format_injection(skill_content: &str) -> String {
+    format!("<arcanum>\n{skill_content}\n</arcanum>")
+}
+
+/// What one monitor tick does with a fresh `total_tokens` reading.
+#[derive(Debug, PartialEq, Eq)]
+enum Tick {
+    /// Re-read the loaded skill and enqueue it; advance the baseline.
+    Inject,
+    /// No skill loaded — advance the baseline quietly (no injection).
+    AdvanceBaseline,
+    /// Skill loaded but below threshold — keep accumulating.
+    Hold,
+}
+
+/// Decide what a tick does given the injection baseline, the new total, the
+/// repeat threshold, and whether a skill is loaded. Injection is a REFRESHER,
+/// not an initializer: it fires only once usage grows strictly past
+/// `token_repeat` beyond the baseline. The first observation just records the
+/// baseline — a freshly loaded skill is delivered by `load_skill`'s tool
+/// response, not by the monitor.
+fn decide(base: Option<i64>, new: i64, token_repeat: i64, has_skill: bool) -> Tick {
+    match base {
+        // No baseline recorded yet → record it without injecting.
+        None => Tick::AdvanceBaseline,
+        // No skill loaded → keep the baseline current, quietly.
+        Some(_) if !has_skill => Tick::AdvanceBaseline,
+        // Skill loaded and usage grew past the threshold → refresh it.
+        Some(b) if new - b > token_repeat => Tick::Inject,
+        // Skill loaded but below threshold → keep accumulating.
+        Some(_) => Tick::Hold,
+    }
+}
+
 /// Runs the per-AIH token-usage monitor loops in the daemon. One loop per AIH.
 pub struct MonitorService {
     db: Db,
@@ -79,10 +114,10 @@ impl MonitorService {
     }
 
     async fn run_loop(&self, aih: &str, token_repeat: i64) {
-        // `base` is the persisted injection baseline; `seen` is the subscribe
-        // cursor (advances every tick so the loop never busy-spins).
-        let mut base = self.db.last_total_tokens(aih).await.ok().flatten();
-        let mut seen = base;
+        // `seen` is the subscribe cursor (advances every tick so the loop never
+        // busy-spins). The injection baseline lives in the DB (`last_total_tokens`)
+        // and is re-read each tick, so a concurrent `load_skill` reset is picked up.
+        let mut seen = self.db.last_total_tokens(aih).await.ok().flatten();
         loop {
             let new = match self.subscribe(aih, seen).await {
                 Some(Some(total)) => total,
@@ -94,12 +129,15 @@ impl MonitorService {
                 None => break, // executor error / stream ended
             };
             seen = Some(new);
-            let over_threshold = base.map_or(true, |b| new - b > token_repeat);
-            match self.db.skill_ref(aih).await.ok().flatten() {
+            let base = self.db.last_total_tokens(aih).await.ok().flatten();
+            let skill = self.db.skill_ref(aih).await.ok().flatten();
+            match decide(base, new, token_repeat, skill.is_some()) {
                 // A skill is loaded and usage grew past the threshold → re-read
-                // the skill fresh and inject. On a read failure, leave `base`
-                // put so the next tick retries (but `seen` advanced, so no spin).
-                Some(skill) if over_threshold => {
+                // the skill fresh and inject. On a read failure, leave the
+                // baseline put so the next tick retries (but `seen` advanced, so
+                // no spin).
+                Tick::Inject => {
+                    let skill = skill.expect("decide() returns Inject only with a skill");
                     if let Some(content) = common::read_skill_md(
                         &self.executor,
                         &skill.response_id,
@@ -112,16 +150,14 @@ impl MonitorService {
                             self.enqueue(aih, &content),
                             async { let _ = self.db.set_last_total_tokens(aih, new).await; },
                         );
-                        base = Some(new);
                     }
                 }
                 // No skill loaded → advance the baseline quietly (no injection).
-                None => {
+                Tick::AdvanceBaseline => {
                     let _ = self.db.set_last_total_tokens(aih, new).await;
-                    base = Some(new);
                 }
                 // Skill loaded but below threshold → keep accumulating.
-                Some(_) => {}
+                Tick::Hold => {}
             }
         }
     }
@@ -170,7 +206,7 @@ impl MonitorService {
             Some((p, i)) => (Some(p.to_string()), i.to_string()),
             None => (None, aih.to_string()),
         };
-        let message = format!("<arcanum>\n{skill_content}\n</arcanum>");
+        let message = format_injection(skill_content);
         let _ = enqueue::execute(
             &self.executor,
             enqueue::Request {
@@ -186,5 +222,51 @@ impl MonitorService {
             None,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENQUEUE_KEY, Tick, decide, format_injection};
+
+    #[test]
+    fn injection_wraps_content_in_arcanum_tags() {
+        assert_eq!(
+            format_injection("Greeting skill: say hello."),
+            "<arcanum>\nGreeting skill: say hello.\n</arcanum>"
+        );
+    }
+
+    #[test]
+    fn enqueue_key_is_stable() {
+        // A stable key is what makes a newer injection REPLACE any still-queued
+        // earlier one (objectiveai's `agents enqueue` keying) — so reloading a
+        // skill mid-session leaves only the latest injection queued.
+        assert_eq!(ENQUEUE_KEY, "arcanum-skill");
+    }
+
+    #[test]
+    fn no_skill_advances_baseline() {
+        // Regardless of the counts, with no skill loaded we just advance.
+        assert_eq!(decide(None, 999, 10, false), Tick::AdvanceBaseline);
+        assert_eq!(decide(Some(100), 100_000, 10, false), Tick::AdvanceBaseline);
+    }
+
+    #[test]
+    fn first_observation_records_baseline_without_injecting() {
+        // Injection is a refresher, not an initializer: the first tick after a
+        // load records the baseline (the skill was already delivered in
+        // load_skill's tool response) — it does not inject.
+        assert_eq!(decide(None, 0, 1000, true), Tick::AdvanceBaseline);
+        assert_eq!(decide(None, 50_000, 1000, true), Tick::AdvanceBaseline);
+    }
+
+    #[test]
+    fn threshold_is_strictly_greater() {
+        // base=100, repeat=50.
+        assert_eq!(decide(Some(100), 140, 50, true), Tick::Hold); // +40  < 50
+        assert_eq!(decide(Some(100), 150, 50, true), Tick::Hold); // +50 == 50 (not >)
+        assert_eq!(decide(Some(100), 151, 50, true), Tick::Inject); // +51  > 50
+        assert_eq!(decide(Some(100), 200, 50, true), Tick::Inject); // +100 > 50
     }
 }

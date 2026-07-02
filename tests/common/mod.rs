@@ -17,13 +17,17 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use objectiveai_sdk::agent::InlineAgentBaseWithFallbacksOrRemoteCommitOptional;
 use objectiveai_sdk::cli::command::agents::laboratories::attach as labs_attach;
+use objectiveai_sdk::cli::command::agents::logs::list as logs_list;
+use objectiveai_sdk::cli::command::agents::logs::open as logs_open;
 use objectiveai_sdk::cli::command::agents::message::RequestMessage;
+use objectiveai_sdk::agent::completions::message::RichContentPart;
+use objectiveai_sdk::cli::command::agents::queue::list as queue_list;
+use objectiveai_sdk::cli::command::agents::queue::open as queue_open;
 use objectiveai_sdk::cli::command::agents::selector::AgentSelector;
 use objectiveai_sdk::cli::command::agents::spawn as agents_spawn;
 use objectiveai_sdk::cli::command::agents::tags::apply as tags_apply;
 use objectiveai_sdk::cli::command::agents::wait as agents_wait;
 use objectiveai_sdk::cli::command::binary::BinaryExecutor;
-use objectiveai_sdk::cli::command::db::query as db_query;
 use objectiveai_sdk::cli::command::laboratories::create as labs_create;
 use objectiveai_sdk::cli::command::{CommandExecutor, CommandRequest, CommandResponse};
 use serde::Serialize;
@@ -218,47 +222,110 @@ impl Host {
             .await;
     }
 
-    /// Every tool-result text for `response_id`, in order (the strings the agent
-    /// received back from its tool calls).
-    pub async fn tool_texts(&self, response_id: &str) -> Vec<String> {
-        let sql = format!(
-            "SELECT text FROM objectiveai.tool_response_content_text \
-             WHERE response_id = '{}' ORDER BY \"index\", part_index",
-            response_id.replace('\'', "''"),
-        );
-        let resp: db_query::Response = self
-            .execute_one(db_query::Request {
-                path_type: db_query::Path::DbQuery,
-                query: sql,
-                base: Default::default(),
-            })
-            .await;
-        resp.rows
-            .into_iter()
-            .filter_map(|mut row| row.pop())
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect()
+    /// A `Direct` target for `agent instance hierarchy` (split on the last `/`),
+    /// shared by `agents logs list` and `agents queue list`.
+    fn direct_target(aih: &str) -> logs_list::Target {
+        match aih.rsplit_once('/') {
+            Some((parent, instance)) => logs_list::Target::Direct {
+                parent_agent_instance_hierarchy: Some(parent.to_string()),
+                agent_instance: instance.to_string(),
+            },
+            None => logs_list::Target::Direct {
+                parent_agent_instance_hierarchy: None,
+                agent_instance: aih.to_string(),
+            },
+        }
     }
 
-    /// Every queued message text in this state (e.g. arcanum's skill injections).
-    pub async fn message_texts(&self) -> Vec<String> {
-        let resp: db_query::Response = self
-            .execute_one(db_query::Request {
-                path_type: db_query::Path::DbQuery,
-                query: "SELECT text FROM objectiveai.message_queue_texts".to_string(),
+    /// Every text tool-result the agent `aih` received, in order — read entirely
+    /// through `agents logs list --all` + `agents logs open --id` (no db query).
+    pub async fn tool_result_texts(&self, aih: &str) -> Vec<String> {
+        let blocks: Vec<logs_list::ResponseItem> = self
+            .collect_stream(logs_list::Request {
+                path_type: logs_list::Path::AgentsLogsList,
+                pending: false,
+                targets: vec![Self::direct_target(aih)],
+                after_id: None,
+                limit: None,
                 base: Default::default(),
             })
             .await;
-        resp.rows
+        let ids: Vec<i64> = blocks
             .into_iter()
-            .filter_map(|mut row| row.pop())
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
+            .flat_map(|b| match b {
+                logs_list::ResponseItem::ToolResponse { parts, .. } => parts,
+                _ => Vec::new(),
             })
-            .collect()
+            .filter(|p| p.r#type == logs_list::ToolResponsePartType::Text)
+            .map(|p| p.id)
+            .collect();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(text) = self.logs_open(id).await {
+                out.push(text);
+            }
+        }
+        out
+    }
+
+    /// The text body of one log row via `agents logs open --id`.
+    async fn logs_open(&self, id: i64) -> Option<String> {
+        let resp: logs_open::Response = self
+            .execute_one(logs_open::Request {
+                path_type: logs_open::Path::AgentsLogsOpen,
+                id,
+                base: Default::default(),
+            })
+            .await;
+        match resp {
+            logs_open::Response::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Every pending (undelivered) queued message text for `aih` — read through
+    /// `agents queue list --pending` + `agents queue open --id` (no db query).
+    /// This is how arcanum's `<arcanum>…</arcanum>` skill injections surface.
+    pub async fn pending_texts(&self, aih: &str) -> Vec<String> {
+        let blocks: Vec<queue_list::ResponseItem> = self
+            .collect_stream(queue_list::Request {
+                path_type: queue_list::Path::AgentsQueueList,
+                targets: vec![Self::direct_target(aih)],
+                after_id: None,
+                limit: None,
+                base: Default::default(),
+            })
+            .await;
+        let ids: Vec<i64> = blocks
+            .into_iter()
+            .flat_map(|b| match b {
+                queue_list::ResponseItem::AgentInstanceHierarchy { parts, .. } => parts,
+                queue_list::ResponseItem::Tag { parts, .. } => parts,
+            })
+            .filter(|p| p.r#type == queue_list::QueuePartType::Text)
+            .map(|p| p.id)
+            .collect();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(text) = self.queue_open(id).await {
+                out.push(text);
+            }
+        }
+        out
+    }
+
+    /// The text body of one queued content row via `agents queue open --id`.
+    async fn queue_open(&self, id: i64) -> Option<String> {
+        let resp: queue_open::Response = self
+            .execute_one(queue_open::Request {
+                path_type: queue_open::Path::AgentsQueueOpen,
+                id,
+                base: Default::default(),
+            })
+            .await;
+        match resp {
+            RichContentPart::Text { text } => Some(text),
+            _ => None,
+        }
     }
 }

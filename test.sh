@@ -39,9 +39,12 @@ echo "==> objectiveai api config (global)"
 "$HOST" api config backoff-max-elapsed-time-ms set --value 0 --global || true
 
 # 4. Run the suite, then stop the host's servers and exit on nextest's rc.
+#    Serial (`--test-threads=1`): the e2e tests each spin up a real objectiveai
+#    host + postgres + laboratory containers, so running them concurrently
+#    exhausts shared resources (db connections / containers) and times out.
 echo "==> cargo nextest run"
 rc=0
-cargo nextest run "$@" || rc=$?
+cargo nextest run --test-threads=1 "$@" || rc=$?
 
 echo "==> objectiveai kill-all"
 "$HOST" kill-all || true
