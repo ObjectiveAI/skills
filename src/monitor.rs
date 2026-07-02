@@ -141,6 +141,18 @@ impl MonitorService {
         }
     }
 
+    /// Kill the monitor running for `aih`, aborting its loop. Returns whether a
+    /// monitor was actually running (the `unload_skill` path).
+    pub fn stop(&self, aih: &str) -> bool {
+        match self.running.remove(aih) {
+            Some((_, (_, handle))) => {
+                handle.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn run_loop(&self, aih: &str, token_repeat: i64) {
         // `seen` is the subscribe cursor (advances every tick so the loop never
         // busy-spins). The injection baseline lives in the DB (`last_total_tokens`)

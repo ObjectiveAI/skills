@@ -3,6 +3,10 @@
 //! the monitor baseline to the current token count, and start token-usage
 //! monitoring so the skill is RE-injected (refreshed) as the agent's context
 //! grows. Loading itself does not enqueue — the monitor is the only injector.
+//!
+//! `unload_skill` is the inverse: it kills the agent's monitor and clears the
+//! loaded skill. If no skill is loaded it returns a tool-level error to the
+//! agent (not an MCP protocol error).
 
 use rmcp::{
     ErrorData, RoleServer, tool, tool_router,
@@ -77,5 +81,44 @@ impl ArcanumMcp {
         self.monitor.spawn(aih, token_repeat);
 
         Ok(CallToolResult::success(vec![Content::text(content)]))
+    }
+
+    #[tool(
+        name = "unload_skill",
+        description = "Unload the currently loaded skill: stop refreshing it into your context. Errors if no skill is loaded."
+    )]
+    async fn unload_skill(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let aih = common::required_header(&ctx.extensions, AIH_HEADER)?;
+
+        let db = self
+            .context
+            .db()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
+
+        // Nothing loaded → a tool-level error the agent sees (not an MCP error).
+        if db
+            .skill_ref(&aih)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?
+            .is_none()
+        {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "no skill is loaded",
+            )]));
+        }
+
+        // Kill the monitor and clear the loaded skill.
+        self.monitor.stop(&aih);
+        db.delete(&aih)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("db: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            "skill unloaded",
+        )]))
     }
 }
