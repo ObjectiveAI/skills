@@ -17,12 +17,12 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.2.1"
-objectiveai-sdk = { version = "2.2.9", features = ["lockfile"] }
+objectiveai-sdk = { version = "2.2.10", features = ["lockfile"] }
 dotenv = "0.15.0"
 envconfig = "0.11.1"
 
 [dev-dependencies]
-objectiveai-sdk = { version = "2.2.9", features = ["cli", "cli-executor"] }
+objectiveai-sdk = { version = "2.2.10", features = ["cli", "cli-executor"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "net"] }
 futures = "0.3"
 serde_json = "1"
